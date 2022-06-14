@@ -1,0 +1,350 @@
+---
+title: "The excluderanges and nullranges packages"
+author:
+- name: Mario Keller
+  affiliation: Faculty of Biological Sciences, Goethe University Frankfurt
+output:
+    BiocStyle::html_document:
+      toc: TRUE
+      toc_float: TRUE
+      code_folding: hide
+      
+
+header-includes:
+- \makeatletter\renewcommand*{\fps@figure}{h}\makeatother
+- \usepackage{placeins}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE, results = TRUE)
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(knitr)
+
+library(viridis)
+library(ggpubr)
+library(ggsci)
+library(ggbeeswarm)
+
+library(GenomicRanges)
+library(rtracklayer)
+library(GenomicFeatures)
+library(BSgenome.Hsapiens.UCSC.hg38)
+
+```
+
+```{r}
+myTheme <- theme_bw() +
+    theme(axis.text = element_text(size = 14, colour="black"),
+          axis.title = element_text(size=16, colour="black"),
+          axis.ticks=element_line(color="black"),
+          axis.ticks.length=unit(.15, "cm"),
+          panel.border=element_rect(color="black", fill = NA),
+          panel.background = element_blank(),
+          plot.background = element_blank(),
+          legend.text = element_text(size=12),
+          legend.position = "none")
+
+```
+
+# Introduction
+
+When dealing with data from high-throughput experiments there are certain genomic regions that have anomalous, unstructured, or high signal in next-generation sequencing experiments independent of cell line or experiment[^1]. These so-called blacklist regions should be removed right in the beginning of your analysis to prevent false conclusions from your data. BED-files of blacklist regions are available on the [ENCODE project website](https://www.encodeproject.org/search/?searchTerm=exclusion+list). The *excluderanges*[^2] package enables user-friendly access to blacklist regions from different resources that are stored as GRanges objects. The user can easily remove ranges from his/her GRagens object overlapping the loaded blacklist regions. 
+
+A second problem we often encounter is the definition of control ranges we want to compare our ranges of interest against. For instance, we might have a set of differentially regulated introns we want to compare a set control set of non-regulated introns but want to make sure that the length distribution of the introns is the same. Another example is Mirko's famous PSI-matching approach in the context of RNAmaps where we want to have a control set of non-regulated alternative splicing events with an equal distribution of PSI values. The *nullranges*[^3] package enables this matching task under the consideration of one or multiple covariates (e.g intron length or PSI values).
+
+# excluderanges
+
+## Datasets
+
+The dataset I use for the excluderanges section are double-strand break hotspots (DSBhotspots) from HCT116 cells that are loaded from a MAC2 XLS-File and subsequently transfered into a GRanges object.
+
+```{r}
+DSBhotspots <- read.table("/Users/mariokeller/projects/Vassilis/data/sBLISS_HCT116/imb_roukos_2020_07_10_longo_hct116_std_dox_2_hct116stddox2_CGTGTGAG_chr-loc-countDifferentUMI.bed_peaks.hg38.xls", header=TRUE, sep="\t")
+DSBhotspots <- DSBhotspots[!((DSBhotspots$name %>% duplicated()) | (DSBhotspots$name %>% duplicated(., fromLast=TRUE))),]
+
+chromosomes = paste0("chr",c(1:22, "X", "Y"))
+DSBhotspots <- makeGRangesFromDataFrame(DSBhotspots, keep.extra.columns = TRUE)
+DSBhotspots <- DSBhotspots[seqnames(DSBhotspots) %in% chromosomes]
+seqlevels(DSBhotspots) <- chromosomes
+DSBhotspots <- keepSeqlevels(DSBhotspots, chromosomes, pruning.mode = "coarse")
+head(DSBhotspots)
+```
+
+## Removal of hotspots overlapping blacklist regions
+
+We can access the blacklist regions via the AnnotationHub package using the query() function and setting "excluderanges" as second parameter. Let's print the overview to see what is available.
+
+```{r}
+suppressMessages(library(AnnotationHub))
+ah <- AnnotationHub()
+query_data <- query(ah, "excluderanges")
+query_data
+```
+
+We can see that there are 42 records available that belong to four different model organisms.
+
+The blacklist regions can be downloaded as GRanges objects by subsetting the query_data object using the identifier (e.g. query_data[["AH95917"]]). What we do is downloading blacklists from 6 available ENCODE resources and combining them into a single GRanges object using reduce().
+
+```{r}
+excludeGR.hg38.Bernstein <- query_data[["AH95915"]]
+excludeGR.hg38.Kundaje.2 <- query_data[["AH95916"]]
+excludeGR.hg38.Kundaje.1 <- query_data[["AH95917"]]
+excludeGR.hg38.Reddy     <- query_data[["AH95918"]]
+excludeGR.hg38.Wold      <- query_data[["AH95919"]]
+excludeGR.hg38.Yeo       <- query_data[["AH95920"]]
+excludeGR.hg38.all <- reduce(c(excludeGR.hg38.Bernstein, excludeGR.hg38.Kundaje.1, excludeGR.hg38.Kundaje.2, excludeGR.hg38.Reddy, excludeGR.hg38.Wold, excludeGR.hg38.Yeo))
+```
+
+In total, we have `r format(length(excludeGR.hg38.all), big.mark=",")` regions covering `r format(sum(width(excludeGR.hg38.all)), big.mark=",")` bases. 
+
+We can also have a look on the length distribution of the blacklist regions.
+
+```{r}
+width(excludeGR.hg38.all) %>% as.data.frame %>% dplyr::rename(., width=.) %>%
+    ggplot(., aes(x=width)) +
+    geom_density() +
+    scale_x_log10(labels = scales::comma) +#scales::trans_format("log10", scales::math_format(10^.x))) +
+    labs(x="Length of region", y="Density") +
+    myTheme
+```
+
+We can see that the majority of blacklist regions has a length between 1 and 10 kilobases.
+
+Now that we have the blacklist regions in a GRanges object, we can remove those DSBhotspots that overlap any of the blacklist regions using subsetByOverlaps() and setting invert=TRUE. Results are shown in the table.
+
+```{r}
+before <- length(DSBhotspots)
+
+blDSBhotspots <- subsetByOverlaps(DSBhotspots, excludeGR.hg38.all)
+DSBhotspots <- subsetByOverlaps(DSBhotspots, excludeGR.hg38.all, invert = TRUE)
+after <- length(DSBhotspots)
+
+data.frame(set="DSBhotspots", before=before, after=after) %>%
+knitr::kable(., "html") %>% kableExtra::kable_styling("striped") %>% kableExtra::scroll_box(width = "100%")
+```
+
+Here you can see an example of a DSBhotspot region that was removed due to an overlap with a blacklist region. As you can see the region with enriched sBLISS signal falls perfectly into the blacklist region. In addition, I added Repeat Masker tracks and we can see that the signal originates from a LSU-rRNA repeat.
+
+```{r}
+knitr::include_graphics("/Users/mariokeller/projects/special_group_seminar/Screenshot 2022-06-14 at 13.18.36.png")
+```
+
+# nullranges
+
+## Datasets
+
+The datasets I use for the nullranges section are minigenes of regulated and non-regulated cassette exon events. In the beginning it is a GRangesList containing for each minigene 3 exons. For simplicity I reduce each minigene to a single region.
+
+```{r}
+regMiniGenes <- readRDS("/Users/mariokeller/projects/HNRNPH_project/new_2022/subprojects/3_iCLIP/rds/minigenesCEs.rds")
+regMiniGenes <- regMiniGenes[lengths(regMiniGenes)==3]
+
+nonRegMiniGenes <- readRDS("/Users/mariokeller/projects/HNRNPH_project/new_2022/subprojects/3_iCLIP/rds/nonregulatedMinigenesCEs.rds")
+nonRegMiniGenes <- nonRegMiniGenes[lengths(nonRegMiniGenes)==3]
+
+
+regMiniGenes <- lapply(regMiniGenes, function(gr){
+  event_id <- gr$event_id %>% unique
+  nH <- gr$nH %>% unique
+  ec50 <- gr$ec50 %>% unique
+  hillCat <- gr$hillCat %>% unique
+  gr <- range(gr)
+  gr$event_id <- event_id
+  gr$nH <- nH
+  gr$ec50 <- ec50
+  gr$hillCat <- hillCat
+  return(gr)
+}) %>% as(., "GRangesList") %>% unlist
+seqlevels(regMiniGenes) <- paste0("chr", c(1:22,"X","Y"))
+seqlengths(regMiniGenes) <- seqlengths(Hsapiens)[1:24]
+
+
+nonRegMiniGenes <- lapply(nonRegMiniGenes, function(gr){
+  event_id <- gr$event_id %>% unique
+  gr <- range(gr)
+  gr$event_id <- event_id
+  return(gr)
+}) %>% as(., "GRangesList") %>% unlist
+seqlevels(nonRegMiniGenes) <- paste0("chr", c(1:22,"X","Y"))
+seqlengths(nonRegMiniGenes) <- seqlengths(Hsapiens)[1:24]
+
+regCEs <- readRDS("/Users/mariokeller/projects/HNRNPH_project/new_2022/subprojects/1_MAJIQ/rds/regulatedCEs.rds")
+regMiniGenes$PSI <- regCEs[match(names(regMiniGenes), regCEs$event_id),]$KD_Contr_median_psi
+
+
+regMiniGenes <- regMiniGenes[regMiniGenes$hillCat=="Coop-Enh"]
+
+nonRegCEs <- readRDS("/Users/mariokeller/projects/HNRNPH_project/new_2022/subprojects/1_MAJIQ/rds/nonregulatedCEs.rds")
+nonRegMiniGenes$PSI <- nonRegCEs[match(names(nonRegMiniGenes), nonRegCEs$event_id),]$KD_Contr_median_psi
+
+head(regMiniGenes)
+```
+
+## Matching by PSI
+
+As mentioned in the introduction the nullranges package enables the definition of matched control ranges. For our regulated cassette exon minigenes, we want to have a control set of non-regulated cassette exon minigenes with a similar PSI distribution (PSI values are in a meta-column of the GRanges objects).
+
+For the matching process via matchRanges() three methods are available:
+
+* method = 'rejection': (Default) Rejection sampling with or without replacement. Uses a probability-based approach to select options in the pool that match the focal distribution.
+* method = 'nearest': Nearest neighbor matching with replacement. Finds the nearest neighbor by using a rolling join with data.table. Matching without replacement is not currently supported.
+* method = 'stratified': Iterative stratified sampling with or without replacement. Bins focal and pool propensity scores by value and selects matches within bins until all focal items have a corresponding match in pool.
+
+As the PSI distributions differ very much the default rejection method is not working. We will try three approaches: (i) the nearest method with replacement, (ii) stratified with replacement and (iii) stratified without replacement.
+
+```{r}
+library(nullranges)
+
+names(regMiniGenes) <- c()
+names(nonRegMiniGenes) <- c()
+
+set.seed(123)
+matchedNearest <- matchRanges(focal = regMiniGenes,
+                   pool = nonRegMiniGenes,
+                   covar = ~PSI,
+                   method="nearest",
+                   replace=T)
+
+matchedStratifiedWithRepl <- matchRanges(focal = regMiniGenes,
+                   pool = nonRegMiniGenes,
+                   covar = ~PSI,
+                   method="stratified",
+                   replace=T)
+
+matchedStratifiedWithoutRepl <- matchRanges(focal = regMiniGenes,
+                   pool = nonRegMiniGenes,
+                   covar = ~PSI,
+                   method="stratified",
+                   replace=F)
+```
+
+We will check the outcome by plotting the PSI distributions of the regulated minigenes, all non-regulated minigenes and the three matche sets.
+
+```{r}
+data.frame(set=c(rep("reg", length(regMiniGenes)),
+                 rep("nonReg", length(nonRegMiniGenes)),
+                 rep("matchedNearest", length(matchedNearest)),
+                 rep("matchedStratifiedWithRepl", length(matchedStratifiedWithRepl)),
+                 rep("matchedStratifiedWithoutRepl", length(matchedStratifiedWithoutRepl))),
+           PSI=c(regMiniGenes$PSI, nonRegMiniGenes$PSI, matchedNearest$PSI, matchedStratifiedWithRepl$PSI, matchedStratifiedWithoutRepl$PSI)) %>%
+    mutate(set=factor(set, levels=c("reg", "nonReg", "matchedNearest", "matchedStratifiedWithRepl", "matchedStratifiedWithoutRepl"))) %>%
+    ggplot(., aes(x=set, y=PSI)) +
+        geom_quasirandom() +
+        geom_boxplot(alpha=.5, outlier.size = -1, col="black") +
+        stat_summary(fun.y="mean", geom="point", col="red") +
+        labs(x="Set", y="PSI") +
+        myTheme +
+        theme(axis.text.x = element_text(angle=45, vjust=1, hjust=1))
+
+
+
+data.frame(set=c(rep("reg", length(regMiniGenes)),
+                 rep("nonReg", length(nonRegMiniGenes)),
+                 rep("matchedNearest", length(matchedNearest)),
+                 rep("matchedStratifiedWithRepl", length(matchedStratifiedWithRepl)),
+                 rep("matchedStratifiedWithoutRepl", length(matchedStratifiedWithoutRepl))),
+           PSI=c(regMiniGenes$PSI, nonRegMiniGenes$PSI, matchedNearest$PSI, matchedStratifiedWithRepl$PSI, matchedStratifiedWithoutRepl$PSI)) %>%
+    mutate(set=factor(set, levels=c("reg", "nonReg", "matchedNearest", "matchedStratifiedWithRepl", "matchedStratifiedWithoutRepl"))) %>%
+    ggplot(., aes(x=PSI, y=set, fill=set)) +
+        ggridges::geom_density_ridges() +
+        labs(x="PSI", y="Set") +
+        myTheme +
+        theme(axis.text.x = element_text(angle=45, vjust=1, hjust=1))
+```
+
+As we can see the matching does not work perfectly as the distributions of the regulated and non-regulated minigenes are extremely different.
+
+## Matching by length
+
+In a different scenario we might be interested in picking a control set of non-regulated minigenes with a similar length distribution. Now we can also use the rejection method with and without replacement.
+
+```{r}
+
+regMiniGenes$length <- width(regMiniGenes)
+nonRegMiniGenes$length <- width(nonRegMiniGenes)
+
+set.seed(123)
+matchedRejectionWithRepl <- matchRanges(focal = regMiniGenes,
+                   pool = nonRegMiniGenes,
+                   covar = ~length,
+                   method="rejection",
+                   replace=T)
+
+matchedRejectionWithoutRepl <- matchRanges(focal = regMiniGenes,
+                   pool = nonRegMiniGenes,
+                   covar = ~length,
+                   method="rejection",
+                   replace=F)
+
+matchedNearest <- matchRanges(focal = regMiniGenes,
+                   pool = nonRegMiniGenes,
+                   covar = ~length,
+                   method="nearest",
+                   replace=T)
+
+matchedStratifiedWithRepl <- matchRanges(focal = regMiniGenes,
+                   pool = nonRegMiniGenes,
+                   covar = ~length,
+                   method="stratified",
+                   replace=T)
+
+matchedStratifiedWithoutRepl <- matchRanges(focal = regMiniGenes,
+                   pool = nonRegMiniGenes,
+                   covar = ~length,
+                   method="stratified",
+                   replace=F)
+```
+
+We will check the outcome by plotting the length distributions of the regulated minigenes, all non-regulated minigenes and the five matche sets.
+
+```{r}
+data.frame(set=c(rep("reg", length(regMiniGenes)),
+                 rep("nonReg", length(nonRegMiniGenes)),
+                 rep("matchedRejectionWithRepl", length(matchedRejectionWithRepl)),
+                 rep("matchedRejectionWithoutRepl", length(matchedRejectionWithoutRepl)),
+                 rep("matchedNearest", length(matchedNearest)),
+                 rep("matchedStratifiedWithRepl", length(matchedStratifiedWithRepl)),
+                 rep("matchedStratifiedWithoutRepl", length(matchedStratifiedWithoutRepl))),
+           length=c(regMiniGenes$length, nonRegMiniGenes$length, matchedRejectionWithRepl$length, matchedRejectionWithoutRepl$length, matchedNearest$length, matchedStratifiedWithRepl$length, matchedStratifiedWithoutRepl$length)) %>%
+    mutate(set=factor(set, levels=c("reg", "nonReg", "matchedRejectionWithRepl", "matchedRejectionWithoutRepl", "matchedNearest", "matchedStratifiedWithRepl", "matchedStratifiedWithoutRepl"))) %>%
+    ggplot(., aes(x=set, y=length)) +
+        geom_quasirandom() +
+        scale_y_log10() +
+        geom_boxplot(alpha=.5, outlier.size = -1, col="black") +
+        stat_summary(fun.y="mean", geom="point", col="red") +
+        labs(x="Set", y="Length") +
+        myTheme +
+        theme(axis.text.x = element_text(angle=45, vjust=1, hjust=1))
+
+data.frame(set=c(rep("reg", length(regMiniGenes)),
+                 rep("nonReg", length(nonRegMiniGenes)),
+                 rep("matchedRejectionWithRepl", length(matchedRejectionWithRepl)),
+                 rep("matchedRejectionWithoutRepl", length(matchedRejectionWithoutRepl)),
+                 rep("matchedNearest", length(matchedNearest)),
+                 rep("matchedStratifiedWithRepl", length(matchedStratifiedWithRepl)),
+                 rep("matchedStratifiedWithoutRepl", length(matchedStratifiedWithoutRepl))),
+           length=c(regMiniGenes$length, nonRegMiniGenes$length, matchedRejectionWithRepl$length, matchedRejectionWithoutRepl$length, matchedNearest$length, matchedStratifiedWithRepl$length, matchedStratifiedWithoutRepl$length)) %>%
+    mutate(set=factor(set, levels=c("reg", "nonReg", "matchedRejectionWithRepl", "matchedRejectionWithoutRepl", "matchedNearest", "matchedStratifiedWithRepl", "matchedStratifiedWithoutRepl"))) %>%
+    ggplot(., aes(x=length, y=set, fill=set)) +
+        ggridges::geom_density_ridges() +
+        scale_x_log10() +
+        labs(x="Length", y="Set") +
+        myTheme +
+        theme(axis.text.x = element_text(angle=45, vjust=1, hjust=1))
+
+```
+
+[^1]: [Amemiya et al. 2019](https://www.nature.com/articles/s41598-019-45839-z)
+[^2]: [excluderanges package on Bioconductor](http://bioconductor.org/packages/release/data/annotation/html/excluderanges.html)
+[^3]: [nullranges package on Bioconductor](https://bioconductor.org/packages/release/bioc/html/nullranges.html)
+
+# Session Information
+
+```{r}
+sessionInfo()
+```
